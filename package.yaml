@@ -21,6 +21,11 @@ description:         Please see the README on GitHub at <https://github.com/lbuc
 
 dependencies:
 - base >= 4.7 && < 5
+- tasty-hunit
+- tasty-discover
+- QuickCheck
+- tasty-quickcheck
+- sbv
 
 library:
   source-dirs: src
@@ -38,7 +43,7 @@ executables:
 
 tests:
   erp-test:
-    main:                Spec.hs
+    main:                Driver.hs
     source-dirs:         test
     ghc-options:
     - -threaded

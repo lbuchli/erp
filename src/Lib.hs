@@ -1,10 +1,13 @@
 module Lib (
-  Parser, parse,
-  Tokenizable,
+  Parser(..), parse, ast, parsePossibleError,
+  AST(..),
+  Tokenizable, tokenize, tokens, checkTok,
   Result,
-  Pos, line, col
+  Pos(..),
+  many1, token
            ) where
 
 import Base
 import Combinators
+import Parsers
 

@@ -4,96 +4,138 @@ module Base where
 
 import Control.Applicative
 import Data.Bifunctor
+import Data.SBV
+import Test.QuickCheck (Arbitrary(..))
 
+{-|
+A position in the source code.
+-}
 data Pos = Pos {
-  line :: Int,
+  row :: Int,
   col :: Int
-}
+} deriving (Eq, Show)
 
 {-|
-    The result of a parsing operation.
-    e: Error type
-    b: AST type
+Abstract syntax tree, a variant of the default rose tree implementation that
+can also carry data on a branch and is thus a bifunctor
 -}
-data Result e t b = Result {
-  result :: b,
-  score  :: Int,       -- keeps track of how good this result is doing; errors
-                       -- increase score, successful parsing operations decrease it
-  errors :: [(e, Pos)]
-}
+data AST a b = Branch b [AST a b] | Leaf Pos a
+  deriving (Eq, Show)
 
-mapScore :: (Int -> Int) -> Result e t b -> Result e t b
-mapScore f (Result res scr errs) = Result res (f scr) errs
+instance (Eq a, Eq b) => EqSymbolic (AST a b) where
+  (.==) x y = toSBool (x == y) 
 
-instance Functor (Result e t) where
-  fmap f (Result res scr errs) = Result (f res) scr errs
+toSBool :: Bool -> SBool
+toSBool True = sTrue
+toSBool False = sFalse
+
+instance Bifunctor AST where
+  first f (Branch x xs) = Branch x (map (first f) xs)
+  first f (Leaf pos x)      = Leaf pos (f x)
+  second f (Branch x xs) = Branch (f x) (map (second f) xs)
+  second _ (Leaf pos x)      = Leaf pos x
+
+instance Functor (AST a) where
+  fmap = second
+
+instance Applicative (AST a) where
+  pure x = Branch x []
+  (<*>) (Branch a xs) (Branch b ys) = Branch (a b) [x <*> y | x <- xs, y <- ys]
+  (<*>) (Branch _ _)  (Leaf pos b)  = Leaf pos b
+  (<*>) (Leaf pos a)  (Branch _ _)  = Leaf pos a
+  (<*>) (Leaf pos a)  (Leaf _ _)    = Leaf pos a
+
+instance (Arbitrary a, Arbitrary b) => Arbitrary (AST a b) where
+  arbitrary = undefined
 
 {-|
-    A general parser
-    i: Input type
-    t: Token type
-    e: Error type
-    b: AST type
+The result of a parsing operation.
+e: Error type
+b: AST type
 -}
-newtype Parser i t e b = Parser {
-  parseToks :: Tokenizable i t => [(t, Pos)] -> ([Result e t b], [(t, Pos)])
-}
+data Result e a b = Result {
+  ast    :: AST a b,
+  score  :: Int,
+  errors :: [(Pos, e)],
+  rest   :: [(Pos, a)]
+} deriving (Eq, Show)
+
+instance Functor (Result e a) where
+  fmap f (Result a s e r) = Result (second f a) s e r
+
+mapScore :: (Int -> Int) -> Result e a b -> Result e a b
+mapScore f (Result a s e r) = Result a (f s) e r
 
 class Tokenizable i t where
-  tokenize :: Pos -> i -> (t, Pos, i)
+  tokenize :: Pos -> i -> (Pos, t, Maybe i)
+
+{-|
+A general parser
+i: Input type
+t: Token type
+e: Error type
+b: AST type
+-}
+newtype Parser i t e a = Parser {
+  parseToks :: Tokenizable i t => [(Pos, t)] -> [Result e t a]
+}
+
+instance Show (Parser i t e a) where
+  show _ = "Parsers can't be shown"
 
 instance Functor (Parser i t e) where
-  fmap f p = Parser $ first (map (fmap f)) . parsePossibleError p
+  fmap f p = Parser $ map (fmap f) . parseToks p
 
 instance Applicative (Parser i t e) where
-  pure x    = Parser $ const ([Result x 0 []], [])
+  pure x    = Parser $ const [Result (Branch x []) 0 [] []]
   (<*>) f a = Parser $ productOf f a
 
-productOf :: Tokenizable i t => Parser i t e (a -> b) -> Parser i t e a -> [(t, Pos)] -> ([Result e t b], [(t, Pos)])
-productOf a b toks = first clean $ res_b
+productOf :: Tokenizable i t => Parser i t e (a -> b) -> Parser i t e a -> [(Pos, t)] -> [Result e t b]
+productOf a b toks = clean res_b
   where
-    res_a = parsePossibleError a toks
-    res_b = first flatten $ first (map (`apply` b)) res_a
-    flatten ([], x) = ([], x)
+    res_a = parsePossibleError a toks 
+    res_b = flatten $ map (`apply` b) res_a
+    flatten [] = []
     flatten (x:xs) = x ++ flatten xs
 
-apply :: Tokenizable i t => (Result e t (a -> b), [(t, Pos)]) -> Parser i t e a -> ([Result e t b], [(t, Pos)])
-apply ra b = (map (\rb -> Result (result (fst ra) $ result rb) (score (fst ra) + score rb) (errors (fst ra) ++ errors rb)) (fst res_b), snd res_b)
+apply :: Tokenizable i t => Result e t (a -> b) -> Parser i t e a -> [Result e t b]
+apply result_a b = map (combine result_a) results_b
   where
-    res_b = parsePossibleError b (snd ra)
+    results_b = parsePossibleError b (rest result_a)
+    combine (Result aa sa ea _) (Result ab sb eb rb) = Result (aa <*> ab) (sa + sb) (ea ++ eb) rb
 
 -- TODO monad instance
 
 instance Alternative (Parser i t e) where
-  empty = Parser $ const ([], [])
-  (<|>) a b = Parser (\toks -> first clean (parsePossibleError a toks <++> parsePossibleError b toks))
-    where
-      (<++>) (res_a, rst_a) (res_b, rst_b) = (res_a ++ res_b, rst_a ++ rst_b) -- TODO WRONG! choose better variant of the two
+  empty = Parser $ const []
+  (<|>) a b = Parser (\toks -> clean (parsePossibleError a toks ++ parsePossibleError b toks))
 
-parsePossibleError :: Tokenizable i t => Parser i t e b -> [(t, Pos)] -> ([Result e t b], [(t, Pos)])
+parsePossibleError :: Tokenizable i t => Parser i t e a -> [(Pos, t)] -> [Result e t a]
 parsePossibleError parser = parseToks (tolerate_error parser)
   where
     tolerate_error :: Parser i t e b -> Parser i t e b
     tolerate_error p
-      =   Parser (first (map (mapScore (1-))) . parseToks p)
-      <|> Parser (first (map (mapScore (+1))) . parseToks p . skip1) -- TODO also invent a token, end innermost production
+      =   Parser (map (mapScore (1-)) . parseToks p)
+      <|> Parser (map (mapScore (+1)) . parseToks p . skip1) -- TODO also invent a token, end innermost production
     skip1 [] = []
     skip1 (_:xs) = xs
   
-parse :: Tokenizable i t => Parser i t e b -> i -> (Maybe (Result e t b), [(t, Pos)])
-parse p i = first select_result $ parsePossibleError p (tokens (Pos 0 0) i)
+parse :: Tokenizable i t => Parser i t e a -> i -> Maybe (Result e t a)
+parse p i = select_result $ parsePossibleError p (tokens (Pos 0 0) i)
   where
     select_result = foldl acc Nothing
     acc Nothing n                            = Just n
     acc (Just prev) n | score n > score prev = Just n
     acc (Just prev) _                        = Just prev
 
-tokens :: Tokenizable i t => Pos -> i -> [(t, Pos)]
-tokens pos rst = (t, pos) : tokens pos' rst'
-  where (t, pos', rst') = tokenize pos rst
+tokens :: Tokenizable i t => Pos -> i -> [(Pos, t)]
+tokens pos r = case r' of
+                 Nothing  -> [(pos, t)]
+                 Just r'' -> (pos, t) : tokens pos' r''
+  where (pos', t, r') = tokenize pos r
 
 -- clean up branches with too many points
-clean :: [Result e t b] -> [Result e t b]
+clean :: [Result e t a] -> [Result e t a]
 clean inp = filter (\x -> score x < max_score) inp
   where
     min_score = foldl (\prev n -> min (score n) prev) 0 inp
